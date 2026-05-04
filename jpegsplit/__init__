@@ -1,6 +1,6 @@
 from .decode import (decode_scan, parse_jpeg)
 from .encode import (encode_scan, make_tile_header, rebuild_tile_jpeg)
-from .split import (crop_tile_blocks, tile_mcu_indices, tile_dims)
+from .split import (crop_tile_blocks, round_tile_size, tile_mcu_indices, tile_dims)
 
 __all__ = ['decode_scan',
            'parse_jpeg',
@@ -8,5 +8,6 @@ __all__ = ['decode_scan',
            'make_tile_header',
            'rebuild_tile_jpeg',
            'crop_tile_blocks',
+           'round_tile_size',
            'tile_mcu_indices',
            'tile_dims']
