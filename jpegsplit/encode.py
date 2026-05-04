@@ -1,6 +1,7 @@
 from __future__ import annotations
 from .model import SOFInfo, SOSInfo
-from .decode import SOF0, SOF2
+from .model import HuffTable
+from .decode import DHT, SOF0, SOF2, canonical_tables
 
 def bit_length_signed(v: int) -> int:
     v = int(v)
@@ -74,19 +75,123 @@ def encode_scan(blocks, sof: SOFInfo, sos: SOSInfo, tables):
     return bits_to_bytes_with_stuffing(bw)
 
 
-def make_tile_header(header: bytes, sof: SOFInfo, new_w: int, new_h: int):
-    data = bytearray(header)
+def clone_tables(tables):
+    cloned = {"qt": dict(tables.get("qt", {})), "ht": {}}
+    for (tc, th), ht in tables.get("ht", {}).items():
+        bits = list(ht.bits)
+        huffval = list(ht.huffval)
+        enc, dec = canonical_tables(bits, huffval)
+        cloned["ht"][(tc, th)] = HuffTable(tc, th, bits, huffval, enc, dec)
+    return cloned
+
+
+def _required_dc_sizes_by_table(tile_blocks, sos: SOSInfo):
+    td_by_cid = {cid: td for cid, td, _ta in sos.components}
+    prev_dc = {cid: 0 for cid, _td, _ta in sos.components}
+    required = {}
+
+    for mcu in tile_blocks:
+        for cid, coeffs in mcu:
+            if cid not in td_by_cid:
+                continue
+            td = td_by_cid[cid]
+            diff = int(coeffs[0]) - prev_dc[cid]
+            prev_dc[cid] = int(coeffs[0])
+            size = bit_length_signed(diff)
+            if td not in required:
+                required[td] = set()
+            required[td].add(size)
+
+    return required
+
+
+def ensure_tile_dc_huffman(tile_blocks, sos: SOSInfo, tables):
+    required_sizes = _required_dc_sizes_by_table(tile_blocks, sos)
+    for td, sizes in required_sizes.items():
+        ht = tables["ht"][(0, td)]
+        bits = list(ht.bits)
+        huffval = list(ht.huffval)
+        for size in sorted(sizes):
+            if size in ht.enc or size in huffval:
+                continue
+            bits[15] += 1
+            huffval.append(size)
+        enc, dec = canonical_tables(bits, huffval)
+        tables["ht"][(0, td)] = HuffTable(0, td, bits, huffval, enc, dec)
+    return tables
+
+
+def _build_dht_segments(tables) -> bytes:
+    payload = bytearray()
+    for tc, th in sorted(tables["ht"]):
+        ht = tables["ht"][(tc, th)]
+        payload.append(((tc & 0x0F) << 4) | (th & 0x0F))
+        payload.extend(int(v) & 0xFF for v in ht.bits)
+        payload.extend(int(v) & 0xFF for v in ht.huffval)
+
+    out = bytearray()
     i = 0
-    while i < len(data) - 1:
-        if data[i] == 0xFF and data[i + 1] in (SOF0, SOF2):
-            L = (data[i + 2] << 8) | data[i + 3]
-            data[i + 5] = (new_h >> 8) & 0xFF
-            data[i + 6] = new_h & 0xFF
-            data[i + 7] = (new_w >> 8) & 0xFF
-            data[i + 8] = new_w & 0xFF
-            return bytes(data)
-        i += 1
-    raise ValueError("SOF not found in header")
+    max_payload = 65533
+    while i < len(payload):
+        chunk = payload[i:i + max_payload]
+        L = len(chunk) + 2
+        out.extend((0xFF, DHT, (L >> 8) & 0xFF, L & 0xFF))
+        out.extend(chunk)
+        i += len(chunk)
+    return bytes(out)
+
+
+def make_tile_header(header: bytes, sof: SOFInfo, new_w: int, new_h: int, tables=None):
+    data = bytes(header)
+    out = bytearray()
+
+    if not (len(data) >= 2 and data[0] == 0xFF and data[1] == 0xD8):
+        raise ValueError("Header does not start with SOI")
+
+    dht_bytes = _build_dht_segments(tables) if tables is not None else None
+    inserted_dht = False
+    found_sof = False
+
+    i = 0
+    while i < len(data):
+        if data[i] != 0xFF:
+            raise ValueError("Invalid marker alignment in JPEG header")
+        marker = data[i + 1]
+
+        if marker == 0xD8:
+            out.extend(data[i:i + 2])
+            i += 2
+            continue
+
+        if marker == 0xD9:
+            out.extend(data[i:i + 2])
+            i += 2
+            continue
+
+        L = (data[i + 2] << 8) | data[i + 3]
+        seg = bytearray(data[i:i + 2 + L])
+
+        if marker == DHT and dht_bytes is not None:
+            if not inserted_dht:
+                out.extend(dht_bytes)
+                inserted_dht = True
+        else:
+            if marker in (SOF0, SOF2):
+                seg[5] = (new_h >> 8) & 0xFF
+                seg[6] = new_h & 0xFF
+                seg[7] = (new_w >> 8) & 0xFF
+                seg[8] = new_w & 0xFF
+                found_sof = True
+            if marker == 0xDA and dht_bytes is not None and not inserted_dht:
+                out.extend(dht_bytes)
+                inserted_dht = True
+            out.extend(seg)
+
+        i += 2 + L
+
+    if not found_sof:
+        raise ValueError("SOF not found in header")
+    return bytes(out)
 
 def rebuild_tile_jpeg(header: bytes, tile_scan: bytes):
     return header + tile_scan + b"\xFF\xD9"
